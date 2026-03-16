@@ -1,0 +1,35 @@
+{
+  "schemaVersion": 1,
+  "id": "serverview",
+  "version": "beta-1.0",
+  "name": "ServerView",
+  "description": "Let the client see like the server does!",
+  "authors": ["imB4"],
+  "contact": {},
+  "license": "MIT License",
+  "icon": "assets/serverview/icon.png",
+  "environment": "*",
+  "entrypoints": {
+    "fabric-datagen": [
+      "b4.serverview.client.ServerviewDataGenerator"
+    ],
+    "client": [
+      "b4.serverview.client.ServerviewClient"
+    ],
+    "main": [
+      "b4.serverview.Serverview"
+    ]
+  },
+  "mixins": [
+    "serverview.mixins.json",
+    {
+      "config": "serverview.client.mixins.json",
+      "environment": "client"
+    }
+  ],
+  "depends": {
+    "fabricloader": ">=${loader_version}",
+    "fabric-api": "*",
+    "minecraft": "1.21.11"
+  }
+}

@@ -1,0 +1,15 @@
+{
+  "required": true,
+  "minVersion": "0.8",
+  "package": "b4.serverview.mixin.client",
+  "compatibilityLevel": "JAVA_21",
+  "client": [
+    "EntityClientMixin",
+    "EntityRendererMixin",
+    "BlockEntityRendererMixin",
+    "EntityTransparencyMixin"
+  ],
+  "injectors": {
+    "defaultRequire": 1
+  }
+}
