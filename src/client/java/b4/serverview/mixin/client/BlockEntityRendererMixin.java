@@ -14,24 +14,14 @@ import org.spongepowered.asm.mixin.injection.callback.CallbackInfo;
 @Mixin(BlockEntityRenderManager.class)
 public class BlockEntityRendererMixin {
 
-    /**
-     * Updated for 1.21.11 ("Mounts of Mayhem")
-     * The new render signature uses State objects instead of the BlockEntity itself.
-     */
+    // Fixed the method descriptor to match 1.21.11's internal structure
     @Inject(
-            method = "render(Lnet/minecraft/client/render/block/entity/state/BlockEntityRenderState;Lnet/minecraft/client/util/math/MatrixStack;Lnet/minecraft/client/render/command/OrderedRenderCommandQueue;Lnet/minecraft/client/render/state/CameraRenderState;)V",
+            method = "render",
             at = @At("HEAD")
     )
-    private void serverview$forceLazyBlockRender(
-            BlockEntityRenderState state,
-            MatrixStack matrices,
-            OrderedRenderCommandQueue commandQueue,
-            CameraRenderState cameraState,
-            CallbackInfo ci
-    ) {
-        // Fix for rendering blocks in border/non-ticked chunks
+    private void serverview$onRender(BlockEntityRenderState state, MatrixStack matrices, OrderedRenderCommandQueue commandQueue, CameraRenderState cameraState, CallbackInfo ci) {
         if (ServerViewConfig.masterToggle) {
-            // Your logic for forcing the render now works with the new state system
+            // Logic to prevent culling will go here once the game launches
         }
     }
 }

@@ -4,10 +4,16 @@
   "package": "b4.serverview.mixin.client",
   "compatibilityLevel": "JAVA_21",
   "client": [
+    "ChunkBorderDebugRendererMixin",
+    "ClientPlayNetworkHandlerMixin",
+    "ClientWorldMixin",
+    "DebugRendererMixin",
     "EntityClientMixin",
     "EntityRendererMixin",
     "BlockEntityRendererMixin",
-    "EntityTransparencyMixin"
+    "PistonBlockEntityMixin",
+    "EntityTransparencyMixin",
+    "WorldRendererMixin"
   ],
   "injectors": {
     "defaultRequire": 1
