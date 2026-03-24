@@ -1,7 +1,7 @@
 {
   "schemaVersion": 1,
   "id": "serverview",
-  "version": "beta-1.0",
+  "version": "beta-1.0.1",
   "name": "ServerView",
   "description": "Let the client see like the server does!",
   "authors": ["imB4"],

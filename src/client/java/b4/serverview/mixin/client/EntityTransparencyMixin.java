@@ -1,9 +1,9 @@
 package b4.serverview.mixin.client;
 
 import b4.serverview.ServerViewConfig;
+import b4.serverview.client.GhostBlockTracker;
 import java.util.List;
 import net.minecraft.block.BlockState;
-import net.minecraft.block.Blocks;
 import net.minecraft.client.render.VertexConsumer;
 import net.minecraft.client.render.block.BlockModelRenderer;
 import net.minecraft.client.render.model.BlockModelPart;
@@ -14,6 +14,7 @@ import org.spongepowered.asm.mixin.Mixin;
 import org.spongepowered.asm.mixin.Unique;
 import org.spongepowered.asm.mixin.injection.At;
 import org.spongepowered.asm.mixin.injection.Inject;
+import org.spongepowered.asm.mixin.injection.ModifyArg;
 import org.spongepowered.asm.mixin.injection.callback.CallbackInfo;
 
 @Mixin(BlockModelRenderer.class)
@@ -34,16 +35,34 @@ public class EntityTransparencyMixin {
             CallbackInfo ci) {
         boolean shouldAdjust = ServerViewConfig.masterToggle
                 && ServerViewConfig.highlightGhostBlocks
-                && state.isOf(Blocks.DIAMOND_BLOCK);
+                && GhostBlockTracker.shouldRenderGhostBlock(pos, state);
 
         serverview$pushedGhostMatrix.set(shouldAdjust);
 
         if (shouldAdjust) {
+            float transparency = Math.max(0.0f, Math.min(1.0f, ServerViewConfig.ghostBlockTransparency));
+            float scale = 1.0F - 0.35F * transparency;
             matrices.push();
             matrices.translate(0.5, 0.5, 0.5);
-            matrices.scale(0.5f, 0.5f, 0.5f);
+            matrices.scale(scale, scale, scale);
             matrices.translate(-0.5, -0.5, -0.5);
         }
+    }
+
+    @ModifyArg(
+            method = "renderQuad",
+            at = @At(
+                    value = "INVOKE",
+                    target = "Lnet/minecraft/client/render/VertexConsumer;quad(Lnet/minecraft/client/util/math/MatrixStack$Entry;Lnet/minecraft/client/render/model/BakedQuad;[FFFFF[II)V"
+            ),
+            index = 6
+    )
+    private float serverview$applyGhostAlpha(float alpha) {
+        if (!Boolean.TRUE.equals(serverview$pushedGhostMatrix.get())) {
+            return alpha;
+        }
+
+        return Math.min(alpha, GhostBlockTracker.getGhostModelAlpha());
     }
 
     @Inject(method = "render", at = @At("RETURN"))

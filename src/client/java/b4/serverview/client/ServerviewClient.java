@@ -4,6 +4,7 @@ import b4.serverview.ServerViewConfig;
 import b4.serverview.accessor.EntityTickAccessor;
 import b4.serverview.network.ChunkStatesPayload;
 import b4.serverview.network.EntityStatePayload;
+import b4.serverview.network.RemoteRodStatePayload;
 import java.util.HashMap;
 import java.util.Map;
 import net.fabricmc.api.ClientModInitializer;
@@ -70,13 +71,23 @@ public class ServerviewClient implements ClientModInitializer {
             });
         });
 
+        ClientPlayNetworking.registerGlobalReceiver(RemoteRodStatePayload.ID, (payload, context) -> {
+            context.client().execute(() -> RemoteRodDetector.onServerRemoteRodState(payload.hasBobber(), payload.remoteActive()));
+        });
+
         ClientTickEvents.END_CLIENT_TICK.register(client -> {
             if (client.world == null) {
                 CHUNK_LEVEL_STATES.clear();
                 RECENT_CHUNK_LOADS.clear();
+                ClientEntityTickStateTracker.clear();
+                GhostBlockTracker.clear();
+                RemoteRodDetector.clear();
             } else {
                 long currentTick = client.world.getTime();
                 RECENT_CHUNK_LOADS.entrySet().removeIf(entry -> currentTick - entry.getValue() > RECENT_CHUNK_LOAD_TTL);
+                ClientEntityTickStateTracker.tick(client.world);
+                GhostBlockTracker.tick(client.world);
+                RemoteRodDetector.tick(client);
             }
 
             while (TOGGLE_ALL_KEY.wasPressed()) {

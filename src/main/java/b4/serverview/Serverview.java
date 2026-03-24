@@ -3,6 +3,7 @@ package b4.serverview;
 import b4.serverview.accessor.EntityTickAccessor;
 import b4.serverview.network.ChunkStatesPayload;
 import b4.serverview.network.EntityStatePayload;
+import b4.serverview.network.RemoteRodStatePayload;
 import net.fabricmc.api.ModInitializer;
 import net.fabricmc.fabric.api.event.lifecycle.v1.ServerTickEvents;
 import net.fabricmc.fabric.api.networking.v1.EntityTrackingEvents;
@@ -15,9 +16,12 @@ import java.util.HashSet;
 import java.util.List;
 import java.util.Map;
 import java.util.Set;
+import java.util.UUID;
 import net.minecraft.entity.Entity;
+import net.minecraft.entity.projectile.FishingBobberEntity;
 import net.minecraft.server.network.ServerPlayerEntity;
 import net.minecraft.server.network.ChunkFilter;
+import net.minecraft.server.world.ChunkLevelType;
 import net.minecraft.server.world.ServerWorld;
 import net.minecraft.util.math.ChunkPos;
 import net.minecraft.util.math.Vec3d;
@@ -26,20 +30,33 @@ import net.minecraft.world.chunk.WorldChunk;
 
 public class Serverview implements ModInitializer {
     private static final int CHUNK_STATE_SYNC_INTERVAL_TICKS = 20;
+    private static final int REMOTE_ROD_SYNC_INTERVAL_TICKS = 20;
+    private static final int LAZY_CHUNK_EXTRA_RADIUS = 3;
+    private static final int TICK_STALL_THRESHOLD_TICKS = 2;
     private static final Map<String, PlayerChunkViewState> PLAYER_CHUNK_VIEW_STATES = new HashMap<>();
+    private static final Map<net.minecraft.registry.RegistryKey<World>, Map<UUID, Integer>> LAST_ENTITY_AGE_BY_WORLD = new HashMap<>();
+    private static final Map<net.minecraft.registry.RegistryKey<World>, Map<UUID, Integer>> STALLED_ENTITY_TICKS_BY_WORLD = new HashMap<>();
+    private static final Map<UUID, RemoteRodSyncState> PLAYER_REMOTE_ROD_SYNC_STATES = new HashMap<>();
 
     @Override
     public void onInitialize() {
         // Register the S2C payload
         PayloadTypeRegistry.playS2C().register(ChunkStatesPayload.ID, ChunkStatesPayload.CODEC);
         PayloadTypeRegistry.playS2C().register(EntityStatePayload.ID, EntityStatePayload.CODEC);
+        PayloadTypeRegistry.playS2C().register(RemoteRodStatePayload.ID, RemoteRodStatePayload.CODEC);
 
         // Sync when an entity's ticking state changes (Lazy Chunks)
         ServerTickEvents.END_WORLD_TICK.register(world -> {
             if (!ServerViewConfig.masterToggle) return;
 
+            net.minecraft.registry.RegistryKey<World> worldKey = world.getRegistryKey();
+            Map<UUID, Integer> lastEntityAgeByUuid = LAST_ENTITY_AGE_BY_WORLD.computeIfAbsent(worldKey, key -> new HashMap<>());
+            Map<UUID, Integer> stalledEntityTicksByUuid = STALLED_ENTITY_TICKS_BY_WORLD.computeIfAbsent(worldKey, key -> new HashMap<>());
+            Set<UUID> seenEntityUuids = new HashSet<>();
+
             for (Entity entity : world.iterateEntities()) {
-                boolean isTicking = world.shouldTickEntityAt(entity.getBlockPos());
+                seenEntityUuids.add(entity.getUuid());
+                boolean isTicking = isEntityTicking(world, entity, lastEntityAgeByUuid, stalledEntityTicksByUuid);
                 Vec3d position = entity.getEntityPos();
                 float yaw = entity.getYaw();
                 float pitch = entity.getPitch();
@@ -57,8 +74,12 @@ public class Serverview implements ModInitializer {
                 }
             }
 
+            lastEntityAgeByUuid.keySet().retainAll(seenEntityUuids);
+            stalledEntityTicksByUuid.keySet().retainAll(seenEntityUuids);
+
             for (ServerPlayerEntity player : world.getPlayers()) {
                 syncLazyChunksForPlayer(player);
+                syncRemoteRodState(player, world.getTime());
             }
         });
 
@@ -85,6 +106,30 @@ public class Serverview implements ModInitializer {
         }
     }
 
+    private boolean isEntityTicking(
+            ServerWorld world,
+            Entity entity,
+            Map<UUID, Integer> lastEntityAgeByUuid,
+            Map<UUID, Integer> stalledEntityTicksByUuid) {
+        UUID entityUuid = entity.getUuid();
+        int currentAge = entity.age;
+        boolean chunkTicking = world.shouldTickEntityAt(entity.getBlockPos());
+        Integer previousAge = lastEntityAgeByUuid.put(entityUuid, currentAge);
+
+        if (!chunkTicking) {
+            stalledEntityTicksByUuid.remove(entityUuid);
+            return false;
+        }
+
+        if (previousAge == null || previousAge != currentAge) {
+            stalledEntityTicksByUuid.remove(entityUuid);
+            return true;
+        }
+
+        int stalledTicks = stalledEntityTicksByUuid.merge(entityUuid, 1, Integer::sum);
+        return stalledTicks < TICK_STALL_THRESHOLD_TICKS;
+    }
+
     private void syncLazyChunksForPlayer(ServerPlayerEntity player) {
         if (!(player.getEntityWorld() instanceof ServerWorld serverWorld)) {
             return;
@@ -93,6 +138,7 @@ public class Serverview implements ModInitializer {
         long currentTick = serverWorld.getTime();
         ChunkPos center = player.getChunkPos();
         int viewDistance = Math.min(player.getViewDistance(), serverWorld.getServer().getPlayerManager().getViewDistance());
+        int effectiveViewDistance = viewDistance + LAZY_CHUNK_EXTRA_RADIUS;
         String playerKey = player.getUuidAsString();
         PlayerChunkViewState state = PLAYER_CHUNK_VIEW_STATES.get(playerKey);
         boolean viewChanged = state == null
@@ -101,7 +147,7 @@ public class Serverview implements ModInitializer {
                 || state.center.x != center.x
                 || state.center.z != center.z;
         boolean shouldSyncChunkStates = viewChanged || currentTick % CHUNK_STATE_SYNC_INTERVAL_TICKS == 0;
-        List<WorldChunk> blockTickingChunksToQueue = new ArrayList<>();
+        List<WorldChunk> lazyChunksToQueue = new ArrayList<>();
         List<ChunkStatesPayload.Entry> chunkStateEntries = shouldSyncChunkStates ? new ArrayList<>() : List.of();
 
         if (state == null || state.viewDistance != viewDistance || state.worldKey != serverWorld.getRegistryKey()) {
@@ -110,20 +156,20 @@ public class Serverview implements ModInitializer {
         } else if (viewChanged) {
             state.center = center;
             ChunkPos currentCenter = center;
-            int currentViewDistance = viewDistance;
-            state.syncedBlockTickingChunks.removeIf(chunkPos -> !isWithinVisibleRange(currentCenter, currentViewDistance, new ChunkPos(chunkPos)));
+            int currentViewDistance = effectiveViewDistance;
+            state.syncedLazyChunks.removeIf(chunkPos -> !isWithinVisibleRange(currentCenter, currentViewDistance, new ChunkPos(chunkPos)));
         }
 
         if (shouldSyncChunkStates) {
-            forEachVisibleChunk(center, viewDistance, pos -> collectChunkState(serverWorld, pos, chunkStateEntries));
+            forEachVisibleChunk(center, effectiveViewDistance, pos -> collectChunkState(serverWorld, pos, chunkStateEntries));
         }
 
         if (ServerViewConfig.borderChunkRenderingEnabled) {
             PlayerChunkViewState currentState = state;
-            forEachVisibleChunk(center, viewDistance, pos -> collectLazyChunk(
+            forEachVisibleChunk(center, effectiveViewDistance, pos -> collectLazyChunk(
                     serverWorld,
                     pos,
-                    blockTickingChunksToQueue,
+                    lazyChunksToQueue,
                     currentState));
         }
 
@@ -131,14 +177,37 @@ public class Serverview implements ModInitializer {
             ServerPlayNetworking.send(player, new ChunkStatesPayload(chunkStateEntries));
         }
 
-        if (!blockTickingChunksToQueue.isEmpty()) {
-            for (WorldChunk chunk : blockTickingChunksToQueue) {
+        if (!lazyChunksToQueue.isEmpty()) {
+            for (WorldChunk chunk : lazyChunksToQueue) {
                 player.networkHandler.chunkDataSender.add(chunk);
             }
         }
 
         player.networkHandler.chunkDataSender.sendChunkBatches(player);
         state.center = center;
+    }
+
+    private void syncRemoteRodState(ServerPlayerEntity player, long currentTick) {
+        FishingBobberEntity bobber = player.fishHook;
+        boolean hasBobber = bobber != null && !bobber.isRemoved();
+        boolean remoteActive = false;
+
+        if (hasBobber && bobber.getEntityWorld() instanceof ServerWorld bobberWorld) {
+            ChunkLevelType levelType = getChunkLevelType(bobberWorld, bobber.getChunkPos());
+            remoteActive = levelType == ChunkLevelType.BLOCK_TICKING;
+        }
+
+        UUID playerUuid = player.getUuid();
+        RemoteRodSyncState previousState = PLAYER_REMOTE_ROD_SYNC_STATES.get(playerUuid);
+        boolean changed = previousState == null
+                || previousState.hasBobber != hasBobber
+                || previousState.remoteActive != remoteActive;
+        boolean periodicResync = previousState == null || currentTick - previousState.lastSyncTick >= REMOTE_ROD_SYNC_INTERVAL_TICKS;
+
+        if (changed || periodicResync) {
+            ServerPlayNetworking.send(player, new RemoteRodStatePayload(hasBobber, remoteActive));
+            PLAYER_REMOTE_ROD_SYNC_STATES.put(playerUuid, new RemoteRodSyncState(hasBobber, remoteActive, currentTick));
+        }
     }
 
     private void forEachVisibleChunk(ChunkPos center, int viewDistance, java.util.function.Consumer<ChunkPos> consumer) {
@@ -156,7 +225,7 @@ public class Serverview implements ModInitializer {
     }
 
     private boolean isWithinVisibleRange(ChunkPos center, int viewDistance, int x, int z) {
-        return ChunkFilter.isWithinDistanceExcludingEdge(center.x, center.z, viewDistance, x, z);
+        return ChunkFilter.isWithinDistance(center.x, center.z, viewDistance, x, z, true);
     }
 
     private void collectChunkState(ServerWorld world, ChunkPos pos, List<ChunkStatesPayload.Entry> chunkStateEntries) {
@@ -169,29 +238,38 @@ public class Serverview implements ModInitializer {
     private void collectLazyChunk(
             ServerWorld world,
             ChunkPos pos,
-            List<WorldChunk> blockTickingChunksToQueue,
+            List<WorldChunk> lazyChunksToQueue,
             PlayerChunkViewState state) {
         WorldChunk chunk = world.getChunkManager().getWorldChunk(pos.x, pos.z);
         long packedChunkPos = pos.toLong();
         if (chunk == null) {
-            state.syncedBlockTickingChunks.remove(packedChunkPos);
+            state.syncedLazyChunks.remove(packedChunkPos);
             return;
         }
 
-        if (chunk.getLevelType() == net.minecraft.server.world.ChunkLevelType.BLOCK_TICKING) {
-            if (state.syncedBlockTickingChunks.add(packedChunkPos)) {
-                blockTickingChunksToQueue.add(chunk);
+        if (isLazyChunkLevel(chunk.getLevelType())) {
+            if (state.syncedLazyChunks.add(packedChunkPos)) {
+                lazyChunksToQueue.add(chunk);
             }
         } else {
-            state.syncedBlockTickingChunks.remove(packedChunkPos);
+            state.syncedLazyChunks.remove(packedChunkPos);
         }
+    }
+
+    private boolean isLazyChunkLevel(ChunkLevelType levelType) {
+        return levelType == ChunkLevelType.BLOCK_TICKING || levelType == ChunkLevelType.FULL;
+    }
+
+    private ChunkLevelType getChunkLevelType(ServerWorld world, ChunkPos pos) {
+        WorldChunk chunk = world.getChunkManager().getWorldChunk(pos.x, pos.z);
+        return chunk == null ? null : chunk.getLevelType();
     }
 
     private static final class PlayerChunkViewState {
         private final net.minecraft.registry.RegistryKey<World> worldKey;
         private ChunkPos center;
         private final int viewDistance;
-        private final Set<Long> syncedBlockTickingChunks = new HashSet<>();
+        private final Set<Long> syncedLazyChunks = new HashSet<>();
 
         private PlayerChunkViewState(
                 net.minecraft.registry.RegistryKey<World> worldKey,
@@ -200,6 +278,18 @@ public class Serverview implements ModInitializer {
             this.worldKey = worldKey;
             this.center = center;
             this.viewDistance = viewDistance;
+        }
+    }
+
+    private static final class RemoteRodSyncState {
+        private final boolean hasBobber;
+        private final boolean remoteActive;
+        private final long lastSyncTick;
+
+        private RemoteRodSyncState(boolean hasBobber, boolean remoteActive, long lastSyncTick) {
+            this.hasBobber = hasBobber;
+            this.remoteActive = remoteActive;
+            this.lastSyncTick = lastSyncTick;
         }
     }
 }
