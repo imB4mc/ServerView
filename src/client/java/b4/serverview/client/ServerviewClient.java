@@ -53,14 +53,38 @@ public class ServerviewClient implements ClientModInitializer {
                 Entity entity = context.client().world.getEntityById(payload.entityId());
                 if (entity instanceof EntityTickAccessor accessor) {
                     accessor.serverview$setTickingTruth(payload.isTicking());
+                    PositionInterpolator interpolator = entity.getInterpolator();
+                    Vec3d serverPos = payload.position();
+                    Vec3d serverVelocity = payload.velocity();
+
+                    if (ServerViewConfig.masterToggle && ServerViewConfig.entitySyncEnabled) {
+                        // Full entity synchronization: Client trusts server completely
+                        // This fixes entity stack separation and prevents client-side position guessing
+                        entity.getTrackedPosition().setPos(serverPos);
+                        entity.refreshPositionAndAngles(serverPos, payload.yaw(), payload.pitch());
+                        
+                        // Set velocity to match server (critical for entity stack separation)
+                        entity.setVelocity(serverVelocity);
+                        
+                        // Clear interpolation to prevent client-side smoothing interference
+                        if (interpolator != null) {
+                            interpolator.clear();
+                        }
+                        
+                        // Store synced state for consistency checks
+                        accessor.serverview$setLastSyncedVelocity(serverVelocity);
+                        accessor.serverview$setLastSyncedRotation(payload.yaw(), payload.pitch());
+                        return;
+                    }
 
                     if (!payload.isTicking()) {
-                        PositionInterpolator interpolator = entity.getInterpolator();
-                        Vec3d serverPos = payload.position();
+                        // Non-ticked entities: Update position to server truth
                         entity.getTrackedPosition().setPos(serverPos);
 
                         if (ServerViewConfig.masterToggle && ServerViewConfig.entityFreezeEnabled) {
+                            // Freeze non-ticked entities in place (entityFreezeEnabled)
                             entity.refreshPositionAndAngles(serverPos, payload.yaw(), payload.pitch());
+                            entity.setVelocity(Vec3d.ZERO);
                         }
 
                         if (interpolator != null) {
@@ -81,12 +105,14 @@ public class ServerviewClient implements ClientModInitializer {
                 RECENT_CHUNK_LOADS.clear();
                 ClientEntityTickStateTracker.clear();
                 GhostBlockTracker.clear();
+                IllegalBlockDetector.clear();
                 RemoteRodDetector.clear();
             } else {
                 long currentTick = client.world.getTime();
                 RECENT_CHUNK_LOADS.entrySet().removeIf(entry -> currentTick - entry.getValue() > RECENT_CHUNK_LOAD_TTL);
                 ClientEntityTickStateTracker.tick(client.world);
                 GhostBlockTracker.tick(client.world);
+                IllegalBlockDetector.tick(client.world);
                 RemoteRodDetector.tick(client);
             }
 

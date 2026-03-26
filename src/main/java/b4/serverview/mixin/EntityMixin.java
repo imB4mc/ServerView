@@ -9,7 +9,7 @@ import org.spongepowered.asm.mixin.Unique;
 @Mixin(Entity.class)
 public abstract class EntityMixin implements EntityTickAccessor {
     @Unique
-    private boolean serverview$isTicking = true; // Default to true
+    private boolean serverview$isTicking = true;
     @Unique
     private Vec3d serverview$lastSyncedPos = Vec3d.ZERO;
     @Unique
@@ -18,6 +18,12 @@ public abstract class EntityMixin implements EntityTickAccessor {
     private float serverview$lastSyncedPitch;
     @Unique
     private boolean serverview$hasSyncedSnapshot;
+    @Unique
+    private Vec3d serverview$lastSyncedVelocity = Vec3d.ZERO;
+    @Unique
+    private float serverview$lastSyncedRotationYaw;
+    @Unique
+    private float serverview$lastSyncedRotationPitch;
 
     @Override
     public void serverview$setTickingTruth(boolean isTicking) {
@@ -43,5 +49,27 @@ public abstract class EntityMixin implements EntityTickAccessor {
                 && this.serverview$lastSyncedPos.squaredDistanceTo(pos) < 1.0E-7
                 && Float.compare(this.serverview$lastSyncedYaw, yaw) == 0
                 && Float.compare(this.serverview$lastSyncedPitch, pitch) == 0;
+    }
+
+    @Override
+    public void serverview$setLastSyncedVelocity(Vec3d velocity) {
+        this.serverview$lastSyncedVelocity = velocity;
+    }
+
+    @Override
+    public Vec3d serverview$getLastSyncedVelocity() {
+        return this.serverview$lastSyncedVelocity;
+    }
+
+    @Override
+    public void serverview$setLastSyncedRotation(float yaw, float pitch) {
+        this.serverview$lastSyncedRotationYaw = yaw;
+        this.serverview$lastSyncedRotationPitch = pitch;
+    }
+
+    @Override
+    public void serverview$getLastSyncedRotation(float[] out) {
+        out[0] = this.serverview$lastSyncedRotationYaw;
+        out[1] = this.serverview$lastSyncedRotationPitch;
     }
 }

@@ -13,7 +13,8 @@
     "BlockEntityRendererMixin",
     "PistonBlockEntityMixin",
     "EntityTransparencyMixin",
-    "WorldRendererMixin"
+    "WorldRendererMixin",
+    "LivingEntityMovementMixin"
   ],
   "injectors": {
     "defaultRequire": 1

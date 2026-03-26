@@ -33,10 +33,15 @@ public class Serverview implements ModInitializer {
     private static final int REMOTE_ROD_SYNC_INTERVAL_TICKS = 20;
     private static final int LAZY_CHUNK_EXTRA_RADIUS = 3;
     private static final int TICK_STALL_THRESHOLD_TICKS = 2;
+    private static final int ENTITY_SYNC_INTERVAL_TICKS = 1; // Every tick for accuracy when enabled
+    private static final double ENTITY_POSITION_CHANGE_THRESHOLD = 0.001; // Minimum distance to trigger sync
+    private static final double ENTITY_VELOCITY_CHANGE_THRESHOLD = 0.001; // Minimum velocity change to trigger sync
+    
     private static final Map<String, PlayerChunkViewState> PLAYER_CHUNK_VIEW_STATES = new HashMap<>();
     private static final Map<net.minecraft.registry.RegistryKey<World>, Map<UUID, Integer>> LAST_ENTITY_AGE_BY_WORLD = new HashMap<>();
     private static final Map<net.minecraft.registry.RegistryKey<World>, Map<UUID, Integer>> STALLED_ENTITY_TICKS_BY_WORLD = new HashMap<>();
     private static final Map<UUID, RemoteRodSyncState> PLAYER_REMOTE_ROD_SYNC_STATES = new HashMap<>();
+    private static final Map<Integer, EntitySyncState> ENTITY_SYNC_STATES = new HashMap<>();
 
     @Override
     public void onInitialize() {
@@ -58,10 +63,27 @@ public class Serverview implements ModInitializer {
                 seenEntityUuids.add(entity.getUuid());
                 boolean isTicking = isEntityTicking(world, entity, lastEntityAgeByUuid, stalledEntityTicksByUuid);
                 Vec3d position = entity.getEntityPos();
+                Vec3d velocity = entity.getVelocity();
                 float yaw = entity.getYaw();
                 float pitch = entity.getPitch();
 
                 if (entity instanceof EntityTickAccessor accessor) {
+                    if (ServerViewConfig.entitySyncEnabled) {
+                        // Full entity sync: Always sync to ensure client sees what server knows
+                        accessor.serverview$setTickingTruth(isTicking);
+                        accessor.serverview$setLastSyncedSnapshot(position, yaw, pitch);
+                        accessor.serverview$setLastSyncedVelocity(velocity);
+                        accessor.serverview$setLastSyncedRotation(yaw, pitch);
+                        
+                        // Smart change detection: Only sync if state actually changed
+                        EntitySyncState state = ENTITY_SYNC_STATES.get(entity.getId());
+                        if (shouldSyncEntity(entity.getId(), isTicking, position, velocity, yaw, pitch, state)) {
+                            syncToTrackers(entity, isTicking, position, yaw, pitch, velocity);
+                            ENTITY_SYNC_STATES.put(entity.getId(), new EntitySyncState(isTicking, position, velocity, yaw, pitch));
+                        }
+                        continue;
+                    }
+
                     boolean stateChanged = accessor.serverview$isTickingTruth() != isTicking;
                     boolean lazyEntityMoved = !isTicking && !accessor.serverview$matchesLastSyncedSnapshot(position, yaw, pitch);
                     boolean periodicResync = world.getTime() % 100 == 0;
@@ -69,7 +91,7 @@ public class Serverview implements ModInitializer {
                     if (stateChanged || lazyEntityMoved || periodicResync) {
                         accessor.serverview$setTickingTruth(isTicking);
                         accessor.serverview$setLastSyncedSnapshot(position, yaw, pitch);
-                        syncToTrackers(entity, isTicking, position, yaw, pitch);
+                        syncToTrackers(entity, isTicking, position, yaw, pitch, velocity);
                     }
                 }
             }
@@ -89,18 +111,27 @@ public class Serverview implements ModInitializer {
                 boolean isTicking = entity.getEntityWorld() instanceof net.minecraft.server.world.ServerWorld serverWorld
                         && serverWorld.shouldTickEntityAt(entity.getBlockPos());
                 Vec3d position = entity.getEntityPos();
+                Vec3d velocity = entity.getVelocity();
                 float yaw = entity.getYaw();
                 float pitch = entity.getPitch();
 
                 accessor.serverview$setTickingTruth(isTicking);
                 accessor.serverview$setLastSyncedSnapshot(position, yaw, pitch);
-                ServerPlayNetworking.send(player, new EntityStatePayload(entity.getId(), isTicking, position, yaw, pitch));
+                accessor.serverview$setLastSyncedVelocity(velocity);
+                accessor.serverview$setLastSyncedRotation(yaw, pitch);
+                
+                // Track for entity sync mode change detection
+                if (ServerViewConfig.entitySyncEnabled) {
+                    ENTITY_SYNC_STATES.put(entity.getId(), new EntitySyncState(isTicking, position, velocity, yaw, pitch));
+                }
+                
+                ServerPlayNetworking.send(player, new EntityStatePayload(entity.getId(), isTicking, position, yaw, pitch, velocity));
             }
         });
     }
 
-    private void syncToTrackers(Entity entity, boolean isTicking, Vec3d position, float yaw, float pitch) {
-        EntityStatePayload payload = new EntityStatePayload(entity.getId(), isTicking, position, yaw, pitch);
+    private void syncToTrackers(Entity entity, boolean isTicking, Vec3d position, float yaw, float pitch, Vec3d velocity) {
+        EntityStatePayload payload = new EntityStatePayload(entity.getId(), isTicking, position, yaw, pitch, velocity);
         for (ServerPlayerEntity player : PlayerLookup.tracking(entity)) {
             ServerPlayNetworking.send(player, payload);
         }
@@ -291,5 +322,54 @@ public class Serverview implements ModInitializer {
             this.remoteActive = remoteActive;
             this.lastSyncTick = lastSyncTick;
         }
+    }
+
+    /**
+     * Tracks entity state for change detection in entity sync mode.
+     * Prevents redundant network packets when nothing has changed.
+     */
+    private static final class EntitySyncState {
+        final boolean isTicking;
+        final Vec3d position;
+        final Vec3d velocity;
+        final float yaw;
+        final float pitch;
+
+        EntitySyncState(boolean isTicking, Vec3d position, Vec3d velocity, float yaw, float pitch) {
+            this.isTicking = isTicking;
+            this.position = position;
+            this.velocity = velocity;
+            this.yaw = yaw;
+            this.pitch = pitch;
+        }
+    }
+
+    /**
+     * Determines if an entity should be synced based on state changes.
+     * Returns true if ticking state changed, position moved significantly, or velocity changed.
+     */
+    private static boolean shouldSyncEntity(int entityId, boolean isTicking, Vec3d position, Vec3d velocity, 
+                                             float yaw, float pitch, EntitySyncState lastState) {
+        if (lastState == null) {
+            return true; // First sync for this entity
+        }
+        
+        if (lastState.isTicking != isTicking) {
+            return true; // Ticking state changed
+        }
+        
+        if (lastState.position.squaredDistanceTo(position) > ENTITY_POSITION_CHANGE_THRESHOLD * ENTITY_POSITION_CHANGE_THRESHOLD) {
+            return true; // Position changed significantly
+        }
+        
+        if (lastState.velocity.squaredDistanceTo(velocity) > ENTITY_VELOCITY_CHANGE_THRESHOLD * ENTITY_VELOCITY_CHANGE_THRESHOLD) {
+            return true; // Velocity changed significantly
+        }
+        
+        if (Float.compare(lastState.yaw, yaw) != 0 || Float.compare(lastState.pitch, pitch) != 0) {
+            return true; // Rotation changed
+        }
+        
+        return false; // No significant change
     }
 }
